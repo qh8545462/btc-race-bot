@@ -6,5 +6,5 @@ minute bars with a trend filter, pullback-recovery entries, a stop-loss and
 an equity drawdown brake. Python 3 standard library only, fully
 deterministic.
 
-Entry point: `main.py`. The make.fun bars SDK shim lives unchanged under
+Entry point: `main.ts`. The make.fun bars SDK shim lives unchanged under
 `vendor/`.
