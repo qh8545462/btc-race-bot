@@ -1,51 +1,53 @@
-/** Driftline's strategy: buy the pullback, sell the recovery, sit out the rest.
+/** Driftline's strategy: buy deep dips under the anchor, sell the snap back.
  *
- * The design, in one paragraph: minute-bar BTC spends most of its time
- * chopping sideways, and a round trip costs roughly 20-30 bps in fees,
- * slippage and impact, so a strategy only earns when it trades rarely and
- * only into moves clearly larger than that cost. Driftline therefore watches
- * the deviation of the close from its 20-minute EMA. When the price dips
- * well below that anchor while the slow (4-hour) trend is not collapsing, it
- * buys a moderate position; it sells when the price recovers to just above
- * the anchor, when the dip keeps falling through a stop, or when the trade
- * has had long enough. An equity drawdown brake stops new entries after a
- * bad stretch. Few parameters, all round numbers, nothing fitted bar-by-bar:
- * the same rules are meant to behave the same way on a window nobody has
- * seen. */
+ * What the first version taught (it lost money buying shallow dips under a
+ * fast 20-minute EMA): minute-bar BTC chops sideways, the anchor itself
+ * slides down with the price, and a round trip costs roughly 20-30 bps in
+ * fees, slippage and impact, so shallow, frequent trades bleed. This version
+ * trades the range instead. The anchor is a slow 2-hour EMA. A buy needs the
+ * close a full 0.6% under that anchor — a dip deep enough that a routine
+ * snap back to the anchor pays the round trip several times over — and the
+ * exit waits for the close 0.5% above the anchor, so each completed trade
+ * harvests about a percent of range. Two protections keep the same rules
+ * sane on a window that trends instead of chopping: entries stop when the
+ * anchor itself has fallen more than 1% over the last 4 hours (a falling
+ * market, not a dip), and every trade carries a 1.5% stop and a 15-hour
+ * time limit. An equity drawdown brake stops new entries after a bad
+ * stretch. Few parameters, all round numbers, chosen from the middle of a
+ * broad plateau of workable values rather than the single best fit, so the
+ * behaviour should carry to a window nobody has seen.
+ */
 
 import { Ema, Slope } from './indicators.ts';
 
 export const SYMBOL = 'CBBTC';
 
 // --- Parameters (ratios are unit-free; sizes in bps of equity) -------------
-const FAST_PERIOD = 20; // the anchor EMA the price pulls back from
-const SLOW_PERIOD = 240; // the trend EMA (4 hours of minute bars)
-const SLOPE_LOOKBACK = 120; // bars over which the slow trend's slope is read
-const ENTRY_DIP = -0.0035; // buy when close is 0.35% below the fast anchor
-const EXIT_RECOVERY = 0.0012; // sell when close is 0.12% above the fast anchor
-const TREND_MIN_SLOPE = -0.004; // no buys if the slow EMA fell > 0.4% in 2h
-const TREND_FLOOR = 0.99; // no buys if close is > 1% under the slow EMA
-const STOP_LOSS = -0.006; // sell if the trade is 0.6% under its entry close
-const MAX_HOLD_BARS = 300; // sell if a trade has run 5 hours without paying
-const SIZE_BPS = 6000n; // one position takes 60% of equity
-const COOLDOWN_BARS = 45; // bars to wait after an exit before the next entry
+const ANCHOR_PERIOD = 120; // the 2-hour EMA the range is measured against
+const ENTRY_DIP = -0.006; // buy when close is 0.6% below the anchor
+const EXIT_RISE = 0.005; // sell when close is 0.5% above the anchor
+const GUARD_LOOKBACK = 240; // bars over which the anchor's own drift is read
+const GUARD_MAX_FALL = -0.01; // no buys if the anchor fell > 1% in that span
+const STOP_LOSS = -0.015; // sell if the trade is 1.5% under its entry close
+const MAX_HOLD_BARS = 900; // sell if a trade has run 15 hours without paying
+const SIZE_BPS = 8500n; // one position takes 85% of equity
+const COOLDOWN_BARS = 30; // bars to wait after an exit before the next entry
 const BRAKE_DRAWDOWN = 0.07; // stop new entries once equity is 7% under peak
 const MAX_SLIPPAGE_BPS = 200; // orders tolerate a 2% move from the latest close
-const MIN_HISTORY = SLOW_PERIOD; // bars of history before the first entry
+const MIN_HISTORY = GUARD_LOOKBACK; // bars before the guard can be read
 const MIN_BUY_QUOTE = 1_000_000n; // the protocol's 1 USDC minimum buy
 
 type Order = { side: 'buy' | 'sell'; symbol: string; notional_quote_units?: bigint; qty?: bigint; max_slippage_bps: number };
 
 export class Driftline {
-  private fast = new Ema(FAST_PERIOD);
-  private slow = new Ema(SLOW_PERIOD);
-  private slope = new Slope(SLOPE_LOOKBACK);
+  private anchor = new Ema(ANCHOR_PERIOD);
+  private anchorDrift = new Slope(GUARD_LOOKBACK);
   private barsSeen = 0;
   private entryClose: number | null = null; // close when the position appeared
   private barsHeld = 0;
   private cooldown = 0;
   private peakEquity: bigint | null = null;
-  private lastSlope: number | null = null;
+  private lastDrift: number | null = null;
 
   /** The orders for this batch (possibly none), per the shim's contract. */
   decide(state: any, batch: any): Order[] {
@@ -62,9 +64,8 @@ export class Driftline {
   }
 
   private noteBar(close: number): void {
-    this.fast.update(close);
-    const slowValue = this.slow.update(close);
-    this.lastSlope = this.slope.update(slowValue);
+    const anchorValue = this.anchor.update(close);
+    this.lastDrift = this.anchorDrift.update(anchorValue);
     this.barsSeen += 1;
     if (this.cooldown > 0) this.cooldown -= 1;
   }
@@ -86,10 +87,10 @@ export class Driftline {
       this.barsHeld = 0;
     }
     this.barsHeld += 1;
-    const anchor = this.fast.value;
+    const anchor = this.anchor.value;
     const deviation = anchor ? close / anchor - 1 : 0;
     const pnl = close / this.entryClose - 1;
-    const exitNow = deviation >= EXIT_RECOVERY || pnl <= STOP_LOSS || this.barsHeld >= MAX_HOLD_BARS;
+    const exitNow = deviation >= EXIT_RISE || pnl <= STOP_LOSS || this.barsHeld >= MAX_HOLD_BARS;
     if (!exitNow) return [];
     const holding = state.positions.get(SYMBOL);
     this.entryClose = null;
@@ -101,12 +102,10 @@ export class Driftline {
   private lookForEntry(state: any, close: number): Order[] {
     if (this.barsSeen < MIN_HISTORY) return [];
     if (this.cooldown > 0 || this.brakeOn(state.equity)) return [];
-    const anchor = this.fast.value;
-    const slow = this.slow.value;
-    if (!anchor || !slow) return [];
+    const anchor = this.anchor.value;
+    if (!anchor) return [];
     if (close / anchor - 1 > ENTRY_DIP) return [];
-    if (this.lastSlope !== null && this.lastSlope < TREND_MIN_SLOPE) return [];
-    if (close < slow * TREND_FLOOR) return [];
+    if (this.lastDrift !== null && this.lastDrift < GUARD_MAX_FALL) return [];
     let notional = (state.equity * SIZE_BPS) / 10_000n;
     if (notional > state.cash) notional = state.cash;
     if (notional < MIN_BUY_QUOTE) return [];
